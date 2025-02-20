@@ -3,12 +3,15 @@ import numpy as np
 import random, copy
 import torch
 from torch.utils.data import DataLoader, TensorDataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW, get_linear_schedule_with_warmup, \
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup, \
     pipeline
+from torch.optim import AdamW
 from sklearn.metrics import f1_score
 from sklearn.utils import resample
 import nltk
 from nltk.corpus import wordnet, stopwords
+from transformers import logging
+logging.set_verbosity_error()
 
 # Download NLTK data (WordNet for synonyms, stopwords list)
 nltk.download('wordnet')
@@ -61,52 +64,52 @@ def synonym_replacement(sentence, n=1):
     return " ".join(new_words)
 
 
-# # Data augmentation: Back-Translation (English -> Spanish -> English)
-# translator_en_to_es = pipeline("translation_en_to_es", model="Helsinki-NLP/opus-mt-en-es", device=-1)
-# translator_es_to_en = pipeline("translation_es_to_en", model="Helsinki-NLP/opus-mt-es-en", device=-1)
-#
-#
-# def back_translate(sentence):
-#     try:
-#         es_text = translator_en_to_es(sentence, max_length=MAX_LENGTH)[0]['translation_text']
-#         back_text = translator_es_to_en(es_text, max_length=MAX_LENGTH)[0]['translation_text']
-#         return back_text
-#     except Exception as e:
-#         return sentence  # fallback to original if translation fails
-#
-#
-# # Augment training data (apply to minority class samples)
-# def augment_data(df):
-#     augmented_texts = []
-#     augmented_labels = []
-#     for _, row in df[df['label'] == 1].iterrows():
-#         text = row['paragraph']
-#         # Synonym replacement augmentation
-#         aug_text1 = synonym_replacement(text, n=1)
-#         # Back-translation augmentation
-#         aug_text2 = back_translate(text)
-#         augmented_texts.extend([aug_text1, aug_text2])
-#         augmented_labels.extend([1, 1])
-#     aug_df = pd.DataFrame({'paragraph': augmented_texts, 'label': augmented_labels})
-#     # Combine augmented samples with original data
-#     return pd.concat([df, aug_df], ignore_index=True)
-#
-#
-# # Oversample minority class to balance the dataset
-# def oversample_data(df):
-#     df_majority = df[df['label'] == 0]
-#     df_minority = df[df['label'] == 1]
-#     if len(df_minority) == 0 or len(df_majority) == 0:
-#         return df
-#     if len(df_minority) < len(df_majority):
-#         df_minority_upsampled = resample(df_minority, replace=True, n_samples=len(df_majority), random_state=0)
-#         df_balanced = pd.concat([df_majority, df_minority_upsampled], ignore_index=True)
-#     else:
-#         df_majority_upsampled = resample(df_majority, replace=True, n_samples=len(df_minority), random_state=0)
-#         df_balanced = pd.concat([df_minority, df_majority_upsampled], ignore_index=True)
-#     # Shuffle after oversampling
-#     df_balanced = df_balanced.sample(frac=1, random_state=0).reset_index(drop=True)
-#     return df_balanced
+# Data augmentation: Back-Translation (English -> Spanish -> English)
+translator_en_to_es = pipeline("translation_en_to_es", model="Helsinki-NLP/opus-mt-en-es", device=-1)
+translator_es_to_en = pipeline("translation_es_to_en", model="Helsinki-NLP/opus-mt-es-en", device=-1)
+
+
+def back_translate(sentence):
+    try:
+        es_text = translator_en_to_es(sentence, max_length=MAX_LENGTH)[0]['translation_text']
+        back_text = translator_es_to_en(es_text, max_length=MAX_LENGTH)[0]['translation_text']
+        return back_text
+    except Exception as e:
+        return sentence  # fallback to original if translation fails
+
+
+# Augment training data (apply to minority class samples)
+def augment_data(df):
+    augmented_texts = []
+    augmented_labels = []
+    for _, row in df[df['label'] == 1].iterrows():
+        text = row['paragraph']
+        # Synonym replacement augmentation
+        aug_text1 = synonym_replacement(text, n=1)
+        # Back-translation augmentation
+        aug_text2 = back_translate(text)
+        augmented_texts.extend([aug_text1, aug_text2])
+        augmented_labels.extend([1, 1])
+    aug_df = pd.DataFrame({'paragraph': augmented_texts, 'label': augmented_labels})
+    # Combine augmented samples with original data
+    return pd.concat([df, aug_df], ignore_index=True)
+
+
+# Oversample minority class to balance the dataset
+def oversample_data(df):
+    df_majority = df[df['label'] == 0]
+    df_minority = df[df['label'] == 1]
+    if len(df_minority) == 0 or len(df_majority) == 0:
+        return df
+    if len(df_minority) < len(df_majority):
+        df_minority_upsampled = resample(df_minority, replace=True, n_samples=len(df_majority), random_state=0)
+        df_balanced = pd.concat([df_majority, df_minority_upsampled], ignore_index=True)
+    else:
+        df_majority_upsampled = resample(df_majority, replace=True, n_samples=len(df_minority), random_state=0)
+        df_balanced = pd.concat([df_minority, df_majority_upsampled], ignore_index=True)
+    # Shuffle after oversampling
+    df_balanced = df_balanced.sample(frac=1, random_state=0).reset_index(drop=True)
+    return df_balanced
 
 
 # Create DataLoader for a given DataFrame
@@ -131,7 +134,7 @@ def train_model(train_loader, val_loader, learning_rate, num_epochs=NUM_EPOCHS, 
     warmup_steps = int(WARMUP_PROPORTION * total_steps)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps,
                                                 num_training_steps=total_steps)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler()
     best_f1 = 0.0
     best_state = None
     epochs_no_improve = 0
@@ -145,7 +148,7 @@ def train_model(train_loader, val_loader, learning_rate, num_epochs=NUM_EPOCHS, 
             attention_mask = batch[1].to(device)
             labels = batch[2].to(device)
             # Forward pass (with mixed precision)
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type='cuda'):
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = outputs.loss
             # Backward pass and optimization
@@ -209,14 +212,14 @@ if __name__ == "__main__":
     except FileNotFoundError:
         test_df = None
 
-    print(train_df.head())
-    print(train_df.info())
-    # Augment and balance training data
-    # train_df_aug = augment_data(train_df)
-    # train_df_final = oversample_data(train_df_aug)
+    # print(train_df.head())
+    # print(train_df.info())
     train_df = train_df.dropna(subset=['paragraph'])
     train_df['paragraph'] = train_df['paragraph'].astype(str)
 
+    # Augment and balance training data
+    train_df_aug = augment_data(train_df)
+    train_df_final = oversample_data(train_df_aug)
     for idx, row in train_df.iterrows():
         if not isinstance(row['paragraph'], str):
             print(f"Row {idx} has invalid type: {type(row['paragraph'])}, value = {row['paragraph']}")
